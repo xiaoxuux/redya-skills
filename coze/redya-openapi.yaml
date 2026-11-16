@@ -1,0 +1,479 @@
+openapi: 3.0.3
+info:
+  title: 红鸦AI 小红书图文生成
+  description: |
+    红鸦AI（RedYA）小红书图文批量生成 API。输入一句话主题或粘贴文章/视频链接，一键生成小红书标题、正文与配图。
+    支持普通图文、商品带货图文、爆文复刻（链接解析）、批量出图、单页重生成与账户积分查询。
+
+    鉴权方式：API Key（Bearer Token）。获取 Key：微信登录 https://hy.ithinkai.cn/developer → 左栏「红鸦 Skills」→「生成 API Key」→ 复制 rk- 开头的 Key 填入插件鉴权。积分消耗计入你自己的红鸦账号。
+
+    典型流程：1)（可选）POST /sources 解析参考链接 → 2) POST /outlines 生成大纲 → 3) 确认后 POST /images 整篇出图 → 4) GET /records/{record_id} 轮询到 completed 拿每页 image_url。
+    注意：大纲接口同步返回（最长 5 分钟）；图片 URL 为 COS 直链，建议 7 天内转存；响应 JSON 可能含未转义控制字符，解析失败请用宽松模式重试，不要当成接口故障。
+  version: 1.6.1
+  contact:
+    name: iThinkAI / 红鸦AI
+    url: https://hy.ithinkai.cn
+servers:
+  - url: https://hy.ithinkai.cn
+security:
+  - bearerAuth: []
+paths:
+  /openapi/v1/outlines:
+    post:
+      operationId: generateOutline
+      summary: 生成小红书图文大纲（同步）
+      description: 根据主题生成大纲（标题+正文+每页图片说明）。同步接口，最长 5 分钟。可传 auto=true 让大纲完成后立即整篇出图。普通图文与商品带货图文（传 product_id）分别使用各自渠道。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [topic]
+              properties:
+                topic:
+                  type: string
+                  description: 创作主题
+                style:
+                  type: string
+                  description: 风格，默认普通=xiaohongshu_2，带货=xiaohongshu_4
+                  enum: [xiaohongshu_2, xiaohongshu_3, xiaohongshu_4]
+                prompt_length:
+                  type: string
+                  enum: [short, long]
+                  description: 文案长度，默认 short
+                product_id:
+                  type: string
+                  description: 商品图文模式必传（先用 POST /products 建档拿 product_id）
+                skill_id:
+                  type: string
+                  description: 带货文案风格 Skill（见 GET /skills）
+                image_urls:
+                  type: array
+                  items: { type: string }
+                  description: 参考图 URL 数组（普通模式）
+                source_id:
+                  type: string
+                  description: 先用 POST /sources 解析链接拿到的 ID，原内容作为参考资料
+                knowledge_base_ids:
+                  type: array
+                  items: { type: string }
+                  maxItems: 5
+                  description: 知识库 ID 数组，最多 5 个
+                auto:
+                  type: boolean
+                  description: true = 大纲完成后立即整篇出图
+                callback_url:
+                  type: string
+                  description: auto 时出图完成后的 webhook 回调地址
+      responses:
+        "200":
+          description: 大纲生成成功。auto=false 返回 record_id/title/content/pages[]/points_cost，status=draft；auto=true 额外返回 task_id、pages_submitted、images_points_cost，status=generating_images
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: { type: string }
+                  title: { type: string }
+                  content: { type: string }
+                  pages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        type: { type: string, enum: [cover, content] }
+                        content: { type: string }
+                        matched_image_id: { type: string }
+                  points_cost: { type: integer }
+                  status: { type: string }
+                  task_id: { type: string }
+                  pages_submitted: { type: integer }
+                  images_points_cost: { type: integer }
+                  images_error: { type: string }
+        "401": { $ref: "#/components/responses/Error401" }
+        "402": { $ref: "#/components/responses/Error402" }
+        "429": { $ref: "#/components/responses/Error429" }
+        "5XX": { $ref: "#/components/responses/Error5xx" }
+  /openapi/v1/outlines/{record_id}:
+    put:
+      operationId: updateOutline
+      summary: 编辑大纲
+      description: 按修改意见更新大纲。pages 是整组覆盖（1~15 页），未修改的页也要原样带上。图片生成中返回 409 不可编辑。
+      parameters:
+        - name: record_id
+          in: path
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pages]
+              properties:
+                title: { type: string }
+                content: { type: string }
+                pages:
+                  type: array
+                  minItems: 1
+                  maxItems: 15
+                  items:
+                    type: object
+                    required: [index, type, content]
+                    properties:
+                      index: { type: integer }
+                      type: { type: string, enum: [cover, content] }
+                      content: { type: string }
+      responses:
+        "200":
+          description: 更新成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: { type: string }
+                  updated: { type: boolean }
+                  pages: { type: integer }
+        "409": { $ref: "#/components/responses/Error409" }
+  /openapi/v1/images:
+    post:
+      operationId: generateImages
+      summary: 整篇出图（异步）
+      description: 对已确认的大纲整篇出图，积分按页数预扣，失败自动退款。提交后用 GET /records/{record_id} 轮询。单篇最多 15 页，请勿对同一记录并发提交。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [record_id]
+              properties:
+                record_id: { type: string, description: 大纲记录 ID }
+                product_id: { type: string, description: 商品图文必传，记录出过商品图会自动继承 }
+                skill_id: { type: string }
+                image_urls:
+                  type: array
+                  items: { type: string }
+                  description: 参考图，缺省沿用大纲阶段
+                force:
+                  type: boolean
+                  description: 已完成的记录整篇重出时传 true
+                callback_url: { type: string }
+      responses:
+        "200":
+          description: 出图任务已提交
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: { type: string }
+                  task_id: { type: string }
+                  pages_submitted: { type: integer }
+                  points_cost: { type: integer }
+                  status: { type: string, example: generating_images }
+        "402": { $ref: "#/components/responses/Error402" }
+        "409": { $ref: "#/components/responses/Error409" }
+  /openapi/v1/records/{record_id}:
+    get:
+      operationId: getRecord
+      summary: 查询生成状态与结果（轮询）
+      description: 查询整篇生成进度。建议每 15~30 秒轮询一次。status 终态为 completed/partial/error；partial 表示部分页失败，可单独重生成。image_url 为 COS 直链，建议 7 天内转存。
+      parameters:
+        - name: record_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 记录状态
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: { type: string }
+                  status:
+                    type: string
+                    enum: [draft, generating_outline, generating_images, completed, partial, error]
+                  title: { type: string }
+                  content: { type: string }
+                  style: { type: string }
+                  source: { type: string }
+                  page_count: { type: integer }
+                  created_at: { type: string }
+                  pages:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        index: { type: integer }
+                        type: { type: string }
+                        content: { type: string, description: 该页图片说明 }
+                        status:
+                          type: string
+                          enum: [not_generated, generating, completed, failed]
+                        image_url:
+                          type: string
+                          description: 生成的图片 COS 直链，未完成/失败为空串
+  /openapi/v1/images/regenerate:
+    post:
+      operationId: regeneratePage
+      summary: 单页重生成（异步）
+      description: 对 failed 或不满意的单页重新出图。商品图文自动继承原商品信息。该页生成中返回 409。完成后继续轮询 GET /records/{record_id}。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [record_id, page_index]
+              properties:
+                record_id: { type: string }
+                page_index: { type: integer, description: "要重生成的页码（pages 数组里的 index）" }
+                callback_url: { type: string }
+      responses:
+        "200":
+          description: 重生成任务已提交
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  record_id: { type: string }
+                  page_index: { type: integer }
+                  next_filename: { type: string, example: "2_1.png" }
+                  points_cost: { type: integer }
+                  status: { type: string, example: generating }
+        "409": { $ref: "#/components/responses/Error409" }
+  /openapi/v1/products:
+    post:
+      operationId: createProduct
+      summary: 商品建档（带货前置）
+      description: 用商品图片 URL 一键建立商品档案，拿 product_id 供大纲/出图使用（注意 outlines/images 里 product_id 以字符串传入）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, image_urls]
+              properties:
+                name: { type: string, description: 商品名 }
+                image_urls:
+                  type: array
+                  minItems: 1
+                  maxItems: 30
+                  items: { type: string }
+                  description: 商品图 http(s) 直链，1~30 张
+                labels:
+                  type: array
+                  items:
+                    type: string
+                    enum: [完整商品图, 包装图, 多角度图, 套装组合图, 质地细节图, 其他细节图, 工艺做工图, 产品颜色图, 尺寸规格图, 模特上身图, 使用对比图, 使用步骤图, 场景图, 买家秀真实图, 功能卖点图, 成分配料图, 资质认证图, 其他]
+                  description: 与图片一一对齐，缺省全部按"完整商品图"
+                brand: { type: string }
+                category: { type: string }
+                selling_points:
+                  type: array
+                  items: { type: string }
+                source_ref: { type: string }
+      responses:
+        "200":
+          description: 建档成功
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  product_id: { type: integer }
+                  name: { type: string }
+                  material_count: { type: integer }
+    get:
+      operationId: listProducts
+      summary: 我的商品档案列表
+      description: 列出账号下已建档商品，用户没给新图时可从中复用 product_id。
+      responses:
+        "200":
+          description: 商品列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  products:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        product_id: { type: integer }
+                        name: { type: string }
+                        cover_image: { type: string }
+                        material_count: { type: integer }
+  /openapi/v1/skills:
+    get:
+      operationId: listSkills
+      summary: 可用带货文案风格列表
+      description: 列出带货文案风格 Skill，展示给用户挑选后在大纲接口传 skill_id。
+      responses:
+        "200":
+          description: 风格列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  skills:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        skill_id: { type: string, example: real_exp }
+                        name: { type: string, example: 真实体验种草 }
+                        one_liner: { type: string }
+  /openapi/v1/sources:
+    post:
+      operationId: createSource
+      summary: 链接解析（爆文复刻前置，异步）
+      description: 把小红书/抖音/公众号/快手/B站链接（或整段分享口令）解析成可复用素材。每次成功解析扣 2 积分，失败不扣。解析后用 GET /sources/{source_id} 每 5~10 秒轮询，通常 20~60 秒完成（视频可能到 2 分钟）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  description: 平台链接或整段分享口令，服务端自动提取
+      responses:
+        "200":
+          description: 解析任务已创建
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source_id: { type: string }
+                  platform: { type: string }
+                  content_type: { type: string }
+                  status: { type: string, example: pending }
+                  points_cost: { type: integer }
+  /openapi/v1/sources/{source_id}:
+    get:
+      operationId: getSource
+      summary: 查询链接解析结果（轮询）
+      description: "status 依次为 pending → processing → ready/failed。ready 返回 title/author/content_text（原文案）/transcript（视频口播转写）/images（带鉴权代理地址，直接展示）/original_url。failed 看 error 字段（链接失效、平台风控、视频无人声等）。"
+      parameters:
+        - name: source_id
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        "200":
+          description: 解析状态与结果
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  source_id: { type: string }
+                  platform: { type: string }
+                  content_type: { type: string, enum: [note, video] }
+                  status: { type: string, enum: [pending, processing, ready, failed] }
+                  title: { type: string }
+                  author: { type: string }
+                  content_text: { type: string }
+                  transcript: { type: string }
+                  images:
+                    type: array
+                    items: { type: string }
+                  video_url: { type: string }
+                  original_url: { type: string }
+                  error: { type: string }
+  /openapi/v1/knowledge-bases:
+    get:
+      operationId: listKnowledgeBases
+      summary: 我的知识库列表
+      description: 返回账号下知识库，拿 knowledge_base_id 用于大纲接口的 knowledge_base_ids（最多 5 个）。
+      responses:
+        "200":
+          description: 知识库列表
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  list:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        knowledge_base_id: { type: string, example: folder_xxx }
+                        name: { type: string }
+  /openapi/v1/me:
+    get:
+      operationId: getAccount
+      summary: 账户信息（积分余额/配额）
+      description: 查询积分余额、Key 信息与今日配额。遇到 402/429 时先调它再向用户说明余额或配额情况。
+      responses:
+        "200":
+          description: 账户信息
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  user_id: { type: integer }
+                  nickname: { type: string }
+                  points_balance: { type: integer, description: 积分余额 }
+                  key_name: { type: string }
+                  key_prefix: { type: string, example: rk-1a2b3c4d }
+                  daily_quota: { type: integer, description: 每日生成配额 }
+                  used_today: { type: integer, description: 今日已用 }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 红鸦 API Key（rk- 开头），获取地址 https://hy.ithinkai.cn/developer
+  responses:
+    Error401:
+      description: Key 缺失或无效（missing_key/invalid_key/key_disabled/key_expired）。引导用户到 https://hy.ithinkai.cn/developer 微信登录后生成 API Key
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Error402:
+      description: 积分不足（insufficient_points）。可先调 GET /me 查 points_balance，引导用户去红鸦网页端充值
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Error409:
+      description: 资源冲突（conflict）——生成中或已完成。不是错误，继续轮询 GET /records/{record_id}
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Error429:
+      description: 今日配额用尽（quota_exceeded）。可用 GET /me 查看 daily_quota/used_today
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+    Error5xx:
+      description: 服务端错误。大纲服务已尝试渠道切换，仍失败时报告原因，不要自动连续重提
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorBody" }
+  schemas:
+    ErrorBody:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
