@@ -1,9 +1,11 @@
 ---
 name: redya-xiaohongshu
 description: Create Xiaohongshu illustrated posts, product posts, reference adaptations and Live Photos with RedYA. Review sensitive wording or hand a finished draft to the publishing editor.
+metadata:
+  displayName: "小红书图文与实况图·红鸦 AI"
 ---
 
-# RedYA illustrated posts and Live Photos
+# 小红书图文与实况图·红鸦 AI
 
 Use this skill in an agent that can make HTTPS requests. It creates a title, caption and illustrated pages from a topic, saved product or reference note. It can also process supplied photos, review text on its own, or open a completed post in the platform editor. Use the language requested for the post. Market names and brand names do not establish a partnership.
 
